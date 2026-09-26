@@ -1,0 +1,404 @@
+from __future__ import annotations
+
+import logging
+import time
+import voluptuous as vol
+from typing import Any, Optional, Tuple
+
+from .elkbledom import BLEDOMInstance
+from .const import DOMAIN, EFFECTS, EFFECTS_list, EFFECTS_MAP, EFFECTS_LIST_MAP, CONF_EFFECTS_CLASS
+
+from homeassistant.const import CONF_MAC, CONF_COLOR_TEMP
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.components.light import (
+    PLATFORM_SCHEMA,
+    ATTR_BRIGHTNESS,
+    ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
+    ATTR_RGB_COLOR,
+    ATTR_WHITE,
+    ColorMode,
+    LightEntity,
+    LightEntityFeature,
+)
+from homeassistant.util.color import (match_max_scale, color_temperature_mired_to_kelvin)
+from homeassistant.helpers import device_registry
+
+PARALLEL_UPDATES = 0  # fix entity_platform parallel_updates Semaphore
+
+LOGGER = logging.getLogger(__name__)
+PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
+    vol.Required(CONF_MAC): cv.string
+})
+
+async def async_setup_entry(hass, config_entry, async_add_devices) -> None:
+    instance = hass.data[DOMAIN][config_entry.entry_id]
+    async_add_devices([BLEDOMLight(instance, config_entry.data["name"], config_entry.entry_id)])
+
+class BLEDOMLight(RestoreEntity, LightEntity):
+    def __init__(self, bledomInstance: BLEDOMInstance, name: str, entry_id: str) -> None:
+        self._instance = bledomInstance
+        self._entry_id = entry_id
+        has_white = bool(self._instance.model.get_white_cmd(self._instance.model_name, 255))
+        has_color_temp = bool(self._instance.model.get_color_temp_cmd(self._instance.model_name, 50, 50))
+        has_rgb = bool(self._instance.model.get_color_cmd(self._instance.model_name, 255, 255, 255))
+        has_effect = bool(self._instance.model.get_effect_cmd(self._instance.model_name, 1))
+        self._has_effect_speed = bool(self._instance.model.get_effect_speed_cmd(self._instance.model_name, 128))
+        device_color_modes = set()
+        if has_white and not has_rgb and not has_color_temp:
+            # WHITE cannot coexist with COLOR_TEMP or RGB in HA supported_color_modes
+            device_color_modes.add(ColorMode.WHITE)
+            self._attr_color_mode = ColorMode.WHITE
+        if has_color_temp:
+            device_color_modes.add(ColorMode.COLOR_TEMP)
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+        if has_rgb:
+            device_color_modes.add(ColorMode.RGB)
+            self._attr_color_mode = ColorMode.RGB
+        self._attr_supported_color_modes = device_color_modes
+        self._attr_supported_features = LightEntityFeature.EFFECT if has_effect else LightEntityFeature(0)
+        self._attr_name = name
+        self._attr_effect = None
+        self._attr_unique_id = self._instance.address
+        self._hass = None
+
+    @property
+    def available(self):
+        return self._instance.is_on != None
+
+    @property
+    def brightness(self):
+        return self._instance.brightness
+
+    @property
+    def is_on(self) -> Optional[bool]:
+        return self._instance.is_on
+
+    @property
+    def color_temp_kelvin(self):
+        return self._instance.color_temp_kelvin
+    
+    @property
+    def max_color_temp_kelvin(self):
+        return self._instance.max_color_temp_kelvin
+
+    @property
+    def min_color_temp_kelvin(self):
+        return self._instance.min_color_temp_kelvin
+
+    @property
+    def effect_list(self):
+        """Return list of available effects for this model."""
+        # First check if user has manually configured effects class
+        effects_class_name = self._get_configured_effects_class()
+        if effects_class_name:
+            # Get the corresponding list using the same position in both maps
+            effects_to_list_map = dict(zip(EFFECTS_MAP.keys(), EFFECTS_LIST_MAP.keys()))
+            effects_list_name = effects_to_list_map.get(effects_class_name)
+            if effects_list_name:
+                return EFFECTS_LIST_MAP.get(effects_list_name, EFFECTS_list)
+        
+        # Otherwise use model default
+        effects_list_name = self._instance.model.get_effects_list(self._instance.model_name)
+        return EFFECTS_LIST_MAP.get(effects_list_name, EFFECTS_list)
+
+    @property
+    def effect(self):
+        """Return current effect."""
+        return self._attr_effect
+
+    @property
+    def extra_state_attributes(self):
+        """Return entity specific state attributes."""
+        if self._has_effect_speed:
+            return {"effect_speed": self._instance.effect_speed}
+        return {}
+
+    @property
+    def rgb_color(self):
+        if self._instance.rgb_color is not None:
+            # Report the user's unscaled colour selection.  In RGB brightness
+            # mode the value most recently transmitted to the controller is
+            # deliberately dimmed; exposing that value makes HA's colour
+            # picker drift as low-value channels are rounded.
+            return match_max_scale((255,), self._instance.get_color_base())
+        return None
+
+    @property
+    def device_info(self):
+        """Return device info."""
+        return DeviceInfo(
+            identifiers={
+                # Serial numbers are unique identifiers within a specific domain
+                (DOMAIN, self._instance.address)
+            },
+            name=self.name,
+            connections={(device_registry.CONNECTION_NETWORK_MAC, self._instance.address)},
+        )
+
+    @property
+    def should_poll(self) -> bool:
+        """No polling needed for a demo light."""
+        return False
+
+    def _get_configured_effects_class(self) -> Optional[str]:
+        """Get the configured effects class from config entry options."""
+        if not self._hass:
+            return None
+        
+        # Get config entry for this entity
+        from homeassistant.helpers import entity_registry
+        ent_reg = entity_registry.async_get(self._hass)
+        entity_entry = ent_reg.async_get(self.entity_id)
+        
+        if entity_entry and entity_entry.config_entry_id:
+            config_entry = self._hass.config_entries.async_get_entry(entity_entry.config_entry_id)
+            if config_entry:
+                return config_entry.options.get(CONF_EFFECTS_CLASS)
+        
+        return None
+    
+    async def async_added_to_hass(self) -> None:
+        """Restore previous state when entity is added to hass."""
+        await super().async_added_to_hass()
+        
+        # Store hass reference for config access
+        self._hass = self.hass
+        
+        # Restore the last known state
+        if (last_state := await self.async_get_last_state()) is not None:
+            LOGGER.debug(f"Restoring previous state for {self.name}: {last_state.state}")
+            
+            # Restore on/off state
+            if last_state.state == "on":
+                self._instance._is_on = True
+                LOGGER.debug(f"Restored state: ON")
+            elif last_state.state == "off":
+                self._instance._is_on = False
+                LOGGER.debug(f"Restored state: OFF")
+            elif last_state.state == "unavailable":
+                # If previous state was unavailable, assume device is off but available
+                # This prevents the entity from staying unavailable after restart
+                self._instance._is_on = False
+                LOGGER.debug(f"Previous state was unavailable, setting to OFF")
+            
+            # Restore brightness
+            if ATTR_BRIGHTNESS in last_state.attributes:
+                self._instance._brightness = last_state.attributes[ATTR_BRIGHTNESS]
+                LOGGER.debug(f"Restored brightness: {self._instance._brightness}")
+            
+            # Restore RGB color
+            if ATTR_RGB_COLOR in last_state.attributes and last_state.attributes[ATTR_RGB_COLOR] is not None:
+                try:
+                    restored_rgb = tuple(last_state.attributes[ATTR_RGB_COLOR])
+                    # HA restores the selected (unscaled) colour.  Keep the
+                    # base colour in sync so the first brightness adjustment
+                    # after a restart does not unexpectedly scale white.
+                    self._instance._rgb_color = restored_rgb
+                    self._instance._rgb_color_base = restored_rgb
+                    if ColorMode.RGB in self._attr_supported_color_modes:
+                        self._attr_color_mode = ColorMode.RGB
+                        LOGGER.debug("Restored RGB color: %s", restored_rgb)
+                    else:
+                        LOGGER.debug("RGB color restored but model does not support RGB mode, ignoring color_mode")
+                except (TypeError, ValueError) as e:
+                    LOGGER.warning(f"Invalid RGB color data, skipping: {e}")
+            
+            # Restore color temperature
+            elif ATTR_COLOR_TEMP_KELVIN in last_state.attributes and last_state.attributes[ATTR_COLOR_TEMP_KELVIN] is not None:
+                try:
+                    self._instance._color_temp_kelvin = last_state.attributes[ATTR_COLOR_TEMP_KELVIN]
+                    if ColorMode.COLOR_TEMP in self._attr_supported_color_modes:
+                        self._attr_color_mode = ColorMode.COLOR_TEMP
+                        LOGGER.debug(f"Restored color temp: {self._instance._color_temp_kelvin}K")
+                    else:
+                        LOGGER.debug("COLOR_TEMP restored but model does not support it, ignoring color_mode")
+                except (TypeError, ValueError) as e:
+                    LOGGER.warning(f"Invalid color temperature data, skipping: {e}")
+            
+            # Restore white mode — only if model actually supports WHITE
+            elif last_state.attributes.get("color_mode") == ColorMode.WHITE:
+                if ColorMode.WHITE in self._attr_supported_color_modes:
+                    self._attr_color_mode = ColorMode.WHITE
+                    LOGGER.debug("Restored color mode: WHITE")
+                else:
+                    LOGGER.debug("Previous color_mode was WHITE but model does not support it, keeping default")
+            
+            # Restore effect
+            if ATTR_EFFECT in last_state.attributes:
+                self._attr_effect = last_state.attributes[ATTR_EFFECT]
+                # Get the correct effects class (user configured or model default)
+                effects_class_name = self._get_configured_effects_class()
+                if not effects_class_name:
+                    effects_class_name = self._instance.model.get_effects_class(self._instance.model_name)
+                effects_class = EFFECTS_MAP.get(effects_class_name, EFFECTS)
+                if self._attr_effect in effects_class.__members__:
+                    self._instance._effect = effects_class[self._attr_effect].value
+                LOGGER.debug(f"Restored effect: {self._attr_effect}")
+            
+            # Restore effect speed from extra attributes
+            if "effect_speed" in last_state.attributes:
+                try:
+                    self._instance._effect_speed = int(last_state.attributes["effect_speed"])
+                    LOGGER.debug(f"Restored effect speed: {self._instance._effect_speed}")
+                except (TypeError, ValueError) as e:
+                    LOGGER.warning(f"Invalid effect speed data, using default: {e}")
+        else:
+            # No previous state found, set default values
+            LOGGER.debug(f"No previous state found for {self.name}, setting defaults")
+            self._instance._is_on = False
+            self._instance._brightness = 255
+
+        # Final safety: ensure color_mode is always valid for this model
+        if self._attr_color_mode not in self._attr_supported_color_modes:
+            fallback = next(iter(self._attr_supported_color_modes), ColorMode.ONOFF)
+            LOGGER.warning(
+                "%s: color_mode '%s' not in supported %s after restore, resetting to '%s'",
+                self.name, self._attr_color_mode, self._attr_supported_color_modes, fallback
+            )
+            self._attr_color_mode = fallback
+
+    def _transform_color_brightness(self, color: Tuple[int, int, int], set_brightness: int):
+        rgb = match_max_scale((255,), color)
+        res = tuple(color * set_brightness // 255 for color in rgb)
+        return res
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        LOGGER.debug(f"Params turn on: {kwargs} color mode: {self._attr_color_mode}")
+        # Transmit the power-on packet only on a genuine off->on transition.
+        # This entity is optimistic (should_poll is False, state is restored on
+        # startup), so self.is_on can disagree with the controller: a strip that
+        # is physically off while HA restored "on" would never receive a
+        # power-on packet and colour/brightness writes alone cannot wake it.
+        # Sending it during an already-on fade, however, makes MELK/ELK
+        # controllers flash briefly, so it must not fire per fade step.
+        was_on = self.is_on
+        # ELK-BLEDDM/BLEDOB have state parsing disabled, so self.is_on is purely
+        # optimistic and can be restored as True after a restart while the strip is
+        # physically off -> the power packet would never be sent and colour writes
+        # alone cannot wake it. Animations are removed, so always (re)assert power
+        # on any turn-on for these models.
+        _optimistic_model = self._instance.model_name in ("ELK-BLEDOB", "ELK-BLEDDM")
+        if (not was_on) or _optimistic_model:
+            await self._instance.turn_on()
+            self._last_power_packet = time.time()
+        if not was_on and self._instance.reset:
+                LOGGER.debug("Change color to white to reset led strip when other infrared control interact")
+                self._attr_effect = None
+                await self._instance.set_color(self._transform_color_brightness((255, 255, 255), 250), is_base_color=False)
+                if ATTR_WHITE in kwargs:
+                    await self._instance.set_white(kwargs[ATTR_WHITE])
+
+        
+        # Tracks whether the brightness packet has already gone out in this
+        # call, so the RGB path below doesn't duplicate it and double the BLE
+        # traffic of every fade step.
+        brightness_sent = False
+
+        if ATTR_BRIGHTNESS in kwargs and kwargs[ATTR_BRIGHTNESS] != self.brightness:
+            brightness = kwargs[ATTR_BRIGHTNESS]
+            if self._attr_color_mode == ColorMode.RGB and self.rgb_color is not None:
+                # RGB mode: use native brightness or scale RGB
+                await self._instance.set_brightness(brightness)
+                brightness_sent = True
+            elif self._attr_color_mode == ColorMode.COLOR_TEMP:
+                # COLOR_TEMP mode: re-apply current temp at new brightness
+                # (also handled below if ATTR_COLOR_TEMP_KELVIN is present, but
+                #  if only brightness changes we must apply it here)
+                if ATTR_COLOR_TEMP_KELVIN not in kwargs and CONF_COLOR_TEMP not in kwargs:
+                    current_temp = self.color_temp_kelvin
+                    if not current_temp:
+                        # No temp known yet — use midpoint of model range
+                        current_temp = (
+                            self._instance.min_color_temp_kelvin
+                            + self._instance.max_color_temp_kelvin
+                        ) // 2
+                    await self._instance.set_color_temp_kelvin(current_temp, brightness)
+            elif self._attr_color_mode == ColorMode.WHITE:
+                # WHITE mode: brightness is the white channel intensity
+                if ATTR_WHITE not in kwargs:
+                    await self._instance.set_white(brightness)
+
+        # Handle legacy color_temp (mireds) sent by some cards/automations
+        if CONF_COLOR_TEMP in kwargs and ATTR_COLOR_TEMP_KELVIN not in kwargs:
+            try:
+                kwargs = dict(kwargs)
+                kwargs[ATTR_COLOR_TEMP_KELVIN] = color_temperature_mired_to_kelvin(
+                    kwargs.pop(CONF_COLOR_TEMP)
+                )
+            except Exception:
+                pass
+
+        if ATTR_COLOR_TEMP_KELVIN in kwargs:
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+            new_temp = kwargs[ATTR_COLOR_TEMP_KELVIN]
+            new_brightness = kwargs.get(ATTR_BRIGHTNESS, self.brightness)
+            # An explicit colour-temperature request must be retransmitted even
+            # when HA already stores the same value, because it also exits an
+            # effect running on the controller.
+            await self._instance.set_color_temp_kelvin(new_temp, new_brightness)
+            self._attr_effect = None
+
+        if ATTR_WHITE in kwargs:
+            if ColorMode.WHITE in self._attr_supported_color_modes:
+                self._attr_color_mode = ColorMode.WHITE
+            await self._instance.set_color(self._transform_color_brightness((255, 255, 255), kwargs[ATTR_WHITE]), is_base_color=False)
+            await self._instance.set_white(kwargs[ATTR_WHITE])
+            self._attr_effect = None
+
+        if ATTR_RGB_COLOR in kwargs:
+            self._attr_color_mode = ColorMode.RGB
+            color = kwargs[ATTR_RGB_COLOR]
+            # Always retransmit an explicitly requested colour.  HA may still
+            # display a colour selected before an effect started, so equality
+            # with optimistic state does not mean the controller is in RGB mode.
+            await self._instance.set_color(color, is_base_color=True)
+            current_brightness = kwargs.get(ATTR_BRIGHTNESS, self.brightness)
+            if current_brightness and current_brightness != 255 and not brightness_sent:
+                await self._instance.set_brightness(current_brightness)
+            self._attr_effect = None
+
+        if ATTR_EFFECT in kwargs:
+            requested_effect = kwargs[ATTR_EFFECT]
+            # Get the correct effects class (user configured or model default)
+            effects_class_name = self._get_configured_effects_class()
+            if not effects_class_name:
+                effects_class_name = self._instance.model.get_effects_class(self._instance.model_name)
+            effects_class = EFFECTS_MAP.get(effects_class_name, EFFECTS)
+            effect_value = effects_class[requested_effect].value
+            LOGGER.debug(
+                "%s: Requesting effect '%s' (0x%02x) using %s",
+                self.name,
+                requested_effect,
+                effect_value,
+                effects_class_name,
+            )
+            await self._instance.set_effect(effect_value)
+            # ELK-BLEDOB exposes speed as a separate command and can drop the
+            # immediate second packet.  Preserve the existing sequence for
+            # other models, where applying speed with an effect may be needed.
+            if (
+                self._instance.model_name != "ELK-BLEDOB"
+                and self._instance.effect_speed is not None
+            ):
+                await self._instance.set_effect_speed(
+                    self._instance.effect_speed
+                )
+
+            # Only advertise the effect after the complete command sequence
+            # succeeds. Re-selecting the same effect deliberately retransmits
+            # it because writes without a response can be silently dropped.
+            self._attr_effect = requested_effect
+
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        LOGGER.debug(f"Params turn off: {kwargs} color mode: {self._attr_color_mode}")
+        await self._instance.turn_off()
+        self.async_write_ha_state()
+
+    async def async_update(self) -> None:
+        await self._instance.update()
+        self.async_write_ha_state()

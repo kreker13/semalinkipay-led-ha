@@ -1,0 +1,60 @@
+# ============================================================
+#  template.yaml — голосовые «прокладки» (template light)
+#  Зачем: у BLE-лент через elkbledom состояние читается «на доверии», а Яндекс
+#  требует стабильные entity_id. Мы отдаём Яндексу РОВНО эти две сущности
+#  (light.neon / light.led), а они уже дергают физические ленты.
+#
+#  ВАЖНО — два шага при первой установке:
+#   1) Добавь ленты интеграцией elkbledom и приведи их entity_id к виду
+#      light.neon_phys и light.led_phys (Настройки → Устройства → сущность →
+#      «Изменить entity_id»), ИЛИ подставь сюда реальные id своих лент.
+#   2) Не меняй id прокладок (light.neon / light.led) — Яндекс привязан к ним.
+#
+#  Дефолтный цвет при включении задаётся в block ниже (DEFAULT_COLOR).
+# ============================================================
+- light:
+    - name: "Неоновая лента"
+      unique_id: semlinki_tpl_light_neon
+      state: "{{ states('light.neon_phys') }}"
+      rgb: "{{ state_attr('light.neon_phys','rgb_color') }}"
+      availability: "{{ has_value('light.neon_phys') }}"
+      turn_on:
+        action: light.turn_on
+        target:
+          entity_id: light.neon_phys
+        data:
+          rgb_color: [255, 23, 9]   # DEFAULT_COLOR (RGB при включении)
+          brightness: 255
+      turn_off:
+        action: light.turn_off
+        target:
+          entity_id: light.neon_phys
+      set_rgb:
+        action: light.turn_on
+        target:
+          entity_id: light.neon_phys
+        data:
+          rgb_color: "{{ rgb }}"
+
+    - name: "Светодиодная лента"
+      unique_id: semlinki_tpl_light_led
+      state: "{{ states('light.led_phys') }}"
+      rgb: "{{ state_attr('light.led_phys','rgb_color') }}"
+      availability: "{{ has_value('light.led_phys') }}"
+      turn_on:
+        action: light.turn_on
+        target:
+          entity_id: light.led_phys
+        data:
+          rgb_color: [255, 23, 9]   # DEFAULT_COLOR (RGB при включении)
+          brightness: 255
+      turn_off:
+        action: light.turn_off
+        target:
+          entity_id: light.led_phys
+      set_rgb:
+        action: light.turn_on
+        target:
+          entity_id: light.led_phys
+        data:
+          rgb_color: "{{ rgb }}"

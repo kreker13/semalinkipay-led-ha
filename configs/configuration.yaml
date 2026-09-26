@@ -1,0 +1,27 @@
+# ============================================================
+#  semalinkipay-led-ha — шаблон configuration.yaml
+#  Установщик (install.py) скопирует это в <HA_CONFIG>/configuration.yaml
+#  и заменит значения под твоё окружение. Правь руками только если понимаешь.
+# ============================================================
+homeassistant:
+  name: "semlinki LED"
+  unit_system: metric
+  time_zone: Europe/Moscow
+
+logger:
+  default: info
+  logs:
+    custom_components.yandex_smart_home: debug
+    custom_components.elkbledom: debug
+
+# базовые интеграции HA (web-ui, история, discovery и т.д.)
+default_config:
+
+frontend:
+  themes: !include_dir_merge_named themes
+
+# --- подключаемые файлы проекта ---
+automation: !include automations.yaml
+template: !include template.yaml
+script: !include scripts.yaml
+yandex_smart_home: !include yandex_smart_home.yaml
