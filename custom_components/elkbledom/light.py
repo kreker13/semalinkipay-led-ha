@@ -267,23 +267,16 @@ class BLEDOMLight(RestoreEntity, LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         LOGGER.debug(f"Params turn on: {kwargs} color mode: {self._attr_color_mode}")
-        # Transmit the power-on packet only on a genuine off->on transition.
-        # This entity is optimistic (should_poll is False, state is restored on
-        # startup), so self.is_on can disagree with the controller: a strip that
-        # is physically off while HA restored "on" would never receive a
-        # power-on packet and colour/brightness writes alone cannot wake it.
-        # Sending it during an already-on fade, however, makes MELK/ELK
-        # controllers flash briefly, so it must not fire per fade step.
+        # BLE strips never report real state back (notifications are ignored),
+        # and this entity is optimistic: self.is_on is restored on startup and can
+        # read "on" while the strip is physically off. Animations are gone, so a
+        # turn_on is always a single voice/UI action -- there are no per-fade steps
+        # to spam. Therefore ALWAYS (re)assert the power-on packet for EVERY model
+        # (MELK included): colour-only writes cannot wake a physically-off strip,
+        # which is why a group "turn on" left the neon dark while only re-colouring it.
         was_on = self.is_on
-        # ELK-BLEDDM/BLEDOB have state parsing disabled, so self.is_on is purely
-        # optimistic and can be restored as True after a restart while the strip is
-        # physically off -> the power packet would never be sent and colour writes
-        # alone cannot wake it. Animations are removed, so always (re)assert power
-        # on any turn-on for these models.
-        _optimistic_model = self._instance.model_name in ("ELK-BLEDOB", "ELK-BLEDDM")
-        if (not was_on) or _optimistic_model:
-            await self._instance.turn_on()
-            self._last_power_packet = time.time()
+        await self._instance.turn_on()
+        self._last_power_packet = time.time()
         if not was_on and self._instance.reset:
                 LOGGER.debug("Change color to white to reset led strip when other infrared control interact")
                 self._attr_effect = None
